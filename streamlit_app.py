@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import itertools, random, json, io, zipfile, hashlib, datetime
 
-st.set_page_config(page_title="Phase U — Stress Gauntlet (patched)", layout="wide")
+st.set_page_config(page_title="Phase U — Stress Gauntlet (hybrid)", layout="wide")
 
 # ---------------- sidebar ----------------
 with st.sidebar:
@@ -183,7 +183,7 @@ def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
             if not cands: continue
             sample_cands=cands if len(cands)<=5 else random.sample(cands,5)
             for cand in sample_cands:
-                # build b = u1+u2 for this interface
+                # per-interface b
                 u=np.zeros(len(all_tops),dtype=np.uint8)
                 for i,t in enumerate(topA):
                     if set(cand).issubset(set(t)): u[i]=1
@@ -192,15 +192,22 @@ def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
                 b=u
 
                 x,rank_solve,in_row_space=solve_mod2(D,b)
+
+                # hybrid: in 3D, also test global all-ones b
+                if dim=="3D":
+                    b_all=np.ones(len(all_tops),dtype=np.uint8)
+                    x2,_,in_row_space2=solve_mod2(D,b_all)
+                    if not in_row_space2:
+                        in_row_space=False
+
                 result="SUCCESS" if in_row_space else "FAIL"
-                min_support=int(x.sum()) if x is not None else None
+                min_support=int(x.sum()) if (x is not None and in_row_space) else ""
+
                 notes=[]
                 if iface_type=="face" and (cand not in facesA or cand not in facesB):
                     notes.append("SUSPICIOUS: interface not shared")
                 if result=="SUCCESS" and (D.size==0 or D.shape[1]==0):
                     notes.append("SUSPICIOUS: success with empty D")
-                if iface_type=="face" and result=="FAIL" and (cand in facesA and cand in facesB):
-                    notes.append("SUSPICIOUS: face=no with common face")
 
                 witness_json=None; parity_ok=None
                 if result=="SUCCESS":
@@ -221,7 +228,7 @@ def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
                      "rows":int(D.shape[0]),"cols":int(D.shape[1]),
                      "rank":int(rankD),"nullity":int(nullity),
                      "in_row_space":bool(in_row_space),
-                     "min_support_est":min_support if min_support else "",
+                     "min_support_est":min_support,
                      "interface_type":iface_type,"interface":str(cand),
                      "result":result,"notes":" | ".join(notes)}
                 results.append(row)
@@ -230,7 +237,7 @@ def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
     fail_count=sum(r["result"]=="FAIL" for r in results)
     meta={"dimension":dim,"vmax":vmax,"mode":mode,"sample_size":int(sample_size),
           "max_top_cells":int(max_top_cells),"pairs_cap":int(pairs_cap),"seed":int(seed),
-          "admissibility":"G0 (global φ)","timestamp":datetime.datetime.utcnow().isoformat()+"Z",
+          "admissibility":"Hybrid G0","timestamp":datetime.datetime.utcnow().isoformat()+"Z",
           "row_count":len(results),"success_count":int(success_count),"fail_count":int(fail_count)}
     sha_payload=json.dumps({"meta":meta,"results":results},sort_keys=True).encode()
     meta["sha1_hash"]=hashlib.sha1(sha_payload).hexdigest()
@@ -261,7 +268,7 @@ with right:
     if st.session_state.results:
         csv_buf=io.StringIO()
         pd.DataFrame(st.session_state.results).to_csv(csv_buf,index=False)
-        st.download_button("Download CSV",csv_buf.getvalue(),"phaseU_G0_results.csv",mime="text/csv")
+        st.download_button("Download CSV",csv_buf.getvalue(),"phaseU_results.csv",mime="text/csv")
         zip_buf=io.BytesIO()
         with zipfile.ZipFile(zip_buf,"w",zipfile.ZIP_DEFLATED) as zf:
             for wid,wj in st.session_state.witnesses:
