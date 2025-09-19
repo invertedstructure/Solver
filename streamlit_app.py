@@ -3,9 +3,9 @@ import numpy as np
 import pandas as pd
 import itertools, random, json, io, zipfile, hashlib, datetime
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="Phase U — Stress Gauntlet", layout="wide")
+st.set_page_config(page_title="Phase U — Stress Gauntlet (patched)", layout="wide")
 
+# ---------------- sidebar ----------------
 with st.sidebar:
     st.header("Settings")
     dim = st.selectbox("Dimension", ["2D","3D"], index=1)
@@ -19,17 +19,16 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Special tests")
     use_seeds = st.checkbox("Protected seeds (S², S³)", value=True)
-    use_unions = st.checkbox("Union seeds (S²∨S², RP²∨S² if available)", value=True)
-    use_towers = st.checkbox("Tower seeds (S² ∨ ... ∨ S²)", value=True)
+    use_unions = st.checkbox("Union seeds (S²∨S²)", value=True)
+    use_towers = st.checkbox("Tower seeds (S²∨...∨S²)", value=True)
     use_adversarial = st.checkbox("Adversarial thin/dense", value=False)
-    # metamorphic: you’ll trigger separately on selected rows
 
     st.markdown("---")
-    colb1, colb2 = st.columns(2)
-    with colb1: run = st.button("Run")
-    with colb2: reset = st.button("Reset")
+    col1, col2 = st.columns(2)
+    with col1: run = st.button("Run")
+    with col2: reset = st.button("Reset")
 
-# ---------------- session state ----------------
+# ---------------- state ----------------
 if "results" not in st.session_state: st.session_state.results = []
 if "witnesses" not in st.session_state: st.session_state.witnesses = []
 if "metadata" not in st.session_state: st.session_state.metadata = {}
@@ -42,8 +41,7 @@ if reset:
 
 # ---------------- helpers ----------------
 def faces_of_simplex(simplex):
-    s = list(simplex)
-    return [tuple(sorted(s[:i] + s[i+1:])) for i in range(len(s))]
+    return [tuple(sorted(simplex[:i] + simplex[i+1:])) for i in range(len(simplex))]
 
 def all_d_faces(top_simplices, d):
     S=set()
@@ -52,9 +50,9 @@ def all_d_faces(top_simplices, d):
             S.add(tuple(sorted(f)))
     return sorted(S)
 
-def enumerate_small_complexes(vcount, top_simplex_size, max_top_cells):
+def enumerate_small_complexes(vcount, top_size, max_top_cells):
     verts = list(range(vcount))
-    all_possible = list(itertools.combinations(verts, top_simplex_size))
+    all_possible = list(itertools.combinations(verts, top_size))
     for r in range(1, min(len(all_possible), max_top_cells)+1):
         for comb in itertools.combinations(all_possible, r):
             yield [tuple(sorted(s)) for s in comb]
@@ -68,8 +66,7 @@ def build_D(all_tops, d_faces):
     return D
 
 def rref_rank_mod2(A):
-    M=(A.copy()%2).astype(np.uint8)
-    rows,cols=M.shape; r=0
+    M=(A.copy()%2).astype(np.uint8); rows,cols=M.shape; r=0
     for c in range(cols):
         pivot=None
         for i in range(r,rows):
@@ -105,13 +102,12 @@ def solve_mod2(A,b):
         x[c]=M[i,-1]
     return x%2,r,True
 
-# ---- canonical seeds ----
+# ---- seeds ----
 def seed_S2_tetra_boundary():
     return [(0,1,2),(0,1,3),(0,2,3),(1,2,3)]
 def seed_S3_4simplex_boundary():
     V=[0,1,2,3,4]; return [tuple(sorted([v for v in V if v!=omit])) for omit in V]
 def seed_union_S2S2():
-    # Two S2s sharing one vertex
     A=[(0,1,2),(0,1,3),(0,2,3),(1,2,3)]
     B=[(0,4,5),(0,4,6),(0,5,6),(4,5,6)]
     return A+B
@@ -119,7 +115,8 @@ def seed_tower_S2(n):
     complexes=[]
     for k in range(n):
         offset=3*k
-        T=[(offset,offset+1,offset+2),(offset,offset+1,offset+3),(offset,offset+2,offset+3),(offset+1,offset+2,offset+3)]
+        T=[(offset,offset+1,offset+2),(offset,offset+1,offset+3),
+           (offset,offset+2,offset+3),(offset+1,offset+2,offset+3)]
         complexes+=T
     return complexes
 
@@ -148,7 +145,6 @@ def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
                 if len(pairs)>=pairs_cap: break
             if len(pairs)>=pairs_cap: break
 
-    # add seeds
     if use_seeds:
         if dim=="2D": pairs.append((seed_S2_tetra_boundary(),seed_S2_tetra_boundary(),4,4,"SEED_S2"))
         if dim=="3D": pairs.append((seed_S3_4simplex_boundary(),seed_S3_4simplex_boundary(),5,5,"SEED_S3"))
@@ -159,9 +155,7 @@ def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
             T=seed_tower_S2(n)
             v=len({v for t in T for v in t})
             pairs.append((T,T,v,v,f"SEED_TOWER_S2x{n}"))
-    # adversarial placeholders (thin/dense configs)
     if use_adversarial and dim=="2D":
-        # thin: chain of triangles
         thin=[(0,1,2),(1,2,3),(2,3,4)]
         dense=[(0,1,2),(0,1,3),(0,2,3),(1,2,3)]
         pairs.append((thin,thin,5,5,"ADV_THIN"))
@@ -173,8 +167,7 @@ def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
         id_counter+=1
         facesA=set(f for t in topA for f in faces_of_simplex(t))
         facesB=set(f for t in topB for f in faces_of_simplex(t))
-        vertsA={v for t in topA for v in t}
-        vertsB={v for t in topB for v in t}
+        vertsA={v for t in topA for v in t}; vertsB={v for t in topB for v in t}
         common_vertices=sorted(vertsA&vertsB)
         iface_map={
             "face":[f for f in facesA if f in facesB and len(f)==d],
@@ -183,15 +176,24 @@ def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
         }
         all_tops=list(topA)+list(topB)
         d_faces=all_d_faces(all_tops,d)
-        D=build_D(all_tops,d_faces); b=np.ones(len(all_tops),dtype=np.uint8)
+        D=build_D(all_tops,d_faces)
         rankD,_=rref_rank_mod2(D); nullity=D.shape[1]-rankD
-        x,rank_solve,in_row_space=solve_mod2(D,b)
-        min_support=int(x.sum()) if x is not None else None
+
         for iface_type,cands in iface_map.items():
             if not cands: continue
             sample_cands=cands if len(cands)<=5 else random.sample(cands,5)
             for cand in sample_cands:
+                # build b = u1+u2 for this interface
+                u=np.zeros(len(all_tops),dtype=np.uint8)
+                for i,t in enumerate(topA):
+                    if set(cand).issubset(set(t)): u[i]=1
+                for j,t in enumerate(topB):
+                    if set(cand).issubset(set(t)): u[len(topA)+j]^=1
+                b=u
+
+                x,rank_solve,in_row_space=solve_mod2(D,b)
                 result="SUCCESS" if in_row_space else "FAIL"
+                min_support=int(x.sum()) if x is not None else None
                 notes=[]
                 if iface_type=="face" and (cand not in facesA or cand not in facesB):
                     notes.append("SUSPICIOUS: interface not shared")
@@ -199,28 +201,31 @@ def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
                     notes.append("SUSPICIOUS: success with empty D")
                 if iface_type=="face" and result=="FAIL" and (cand in facesA and cand in facesB):
                     notes.append("SUSPICIOUS: face=no with common face")
+
                 witness_json=None; parity_ok=None
                 if result=="SUCCESS":
                     phi_cols=[j for j,v in enumerate(x) if v==1]
                     phi_faces=[d_faces[j] for j in phi_cols]
                     parity_ok=True
-                    for t in all_tops:
+                    for idx,t in enumerate(all_tops):
                         cnt=sum(1 for f in phi_faces if set(f).issubset(set(t)))
-                        if cnt%2!=1: parity_ok=False; break
+                        if (cnt%2)!=int(b[idx]): parity_ok=False; break
                     if not parity_ok: notes.append("SUSPICIOUS: parity check failed")
                     witness_json={"topsA":topA,"topsB":topB,"interface_type":iface_type,
                                   "interface":cand,"phi_faces":phi_faces,"parity_ok":parity_ok,
                                   "timestamp":datetime.datetime.utcnow().isoformat()+"Z"}
                     witnesses.append((f"UG-{id_counter}",witness_json))
+
                 row={"ID":f"UG-{id_counter}","source":src,"vA":len(vertsA),"vB":len(vertsB),
-                     "topsA_count":len(topA),"topsB_count":len(topB),"rows":int(D.shape[0]),
-                     "cols":int(D.shape[1]),"rank":int(rankD),"nullity":int(nullity),
+                     "topsA_count":len(topA),"topsB_count":len(topB),
+                     "rows":int(D.shape[0]),"cols":int(D.shape[1]),
+                     "rank":int(rankD),"nullity":int(nullity),
                      "in_row_space":bool(in_row_space),
                      "min_support_est":min_support if min_support else "",
                      "interface_type":iface_type,"interface":str(cand),
                      "result":result,"notes":" | ".join(notes)}
                 results.append(row)
-    # metadata
+
     success_count=sum(r["result"]=="SUCCESS" for r in results)
     fail_count=sum(r["result"]=="FAIL" for r in results)
     meta={"dimension":dim,"vmax":vmax,"mode":mode,"sample_size":int(sample_size),
