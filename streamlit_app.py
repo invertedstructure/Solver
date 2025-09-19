@@ -27,7 +27,6 @@ with st.sidebar:
     st.subheader("Newman tests")
     test_core = st.checkbox("Core normal form (odd simplex)")
     test_codim = st.checkbox("Codim-1 gluing (local star)")
-    test_compression = st.checkbox("Certificate compression minimality")
     test_functorial = st.checkbox("Functorial persistence")
     test_oddcycle = st.checkbox("1D odd cycle reduction")
 
@@ -128,12 +127,176 @@ def seed_odd_cycle():
     return [(0,1),(1,2),(2,0)]  # 3-cycle edges
 
 # ---------------- runner ----------------
-def run_phaseU(...):
-    # [keep your hybrid solver loop from before]
-    # inject Newman test seeds if toggled:
-    # - test_core: add single odd (d+1)-simplex
-    # - test_codim: add two tops glued along a face
-    # - test_compression: rerun seeds, compress faces not used in witness (log separately)
-    # - test_functorial: add refinements of S²/S³ (subdivide, attach trees)
-    # - test_oddcycle: for dim=1, add odd cycle edges
-    ...
+def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
+               use_seeds,use_unions,use_towers,use_adversarial,
+               test_core,test_codim,test_functorial,test_oddcycle):
+
+    random.seed(seed)
+    d=1 if dim=="1D" else (2 if dim=="2D" else 3)
+    top_size=d+1
+    reg={v:list(enumerate_small_complexes(v,top_size,max_top_cells)) for v in range(top_size,vmax+1)}
+    vbuckets=[(vA,vB) for vA in reg for vB in reg if len(reg[vA]) and len(reg[vB])]
+    pairs=[]
+    if mode=="Exhaustive":
+        for vA,vB in vbuckets:
+            for A in reg[vA]:
+                for B in reg[vB]:
+                    pairs.append((A,B,vA,vB,"PROC"))
+                    if len(pairs)>=pairs_cap: break
+                if len(pairs)>=pairs_cap: break
+            if len(pairs)>=pairs_cap: break
+    else:
+        for vA,vB in vbuckets:
+            pool=list(itertools.product(reg[vA],reg[vB])); random.shuffle(pool)
+            take=min(sample_size,len(pool))
+            for A,B in pool[:take]:
+                pairs.append((A,B,vA,vB,"PROC"))
+                if len(pairs)>=pairs_cap: break
+            if len(pairs)>=pairs_cap: break
+
+    # protected seeds
+    if use_seeds:
+        if dim=="2D": pairs.append((seed_S2_tetra_boundary(),seed_S2_tetra_boundary(),4,4,"SEED_S2"))
+        if dim=="3D": pairs.append((seed_S3_4simplex_boundary(),seed_S3_4simplex_boundary(),5,5,"SEED_S3"))
+    if use_unions and dim=="2D":
+        pairs.append((seed_union_S2S2(),seed_union_S2S2(),7,7,"SEED_UNION_S2S2"))
+    if use_towers and dim=="2D":
+        for n in [2,3]:
+            T=seed_tower_S2(n)
+            v=len({v for t in T for v in t})
+            pairs.append((T,T,v,v,f"SEED_TOWER_S2x{n}"))
+    if use_adversarial and dim=="2D":
+        thin=[(0,1,2),(1,2,3),(2,3,4)]
+        dense=[(0,1,2),(0,1,3),(0,2,3),(1,2,3)]
+        pairs.append((thin,thin,5,5,"ADV_THIN"))
+        pairs.append((dense,dense,4,4,"ADV_DENSE"))
+
+    # Newman injections
+    if test_core and dim=="2D":
+        pairs.append(([(0,1,2)],[(0,1,2)],3,3,"NEWMAN_CORE2"))
+    if test_core and dim=="3D":
+        pairs.append(([(0,1,2,3)],[(0,1,2,3)],4,4,"NEWMAN_CORE3"))
+    if test_codim and dim=="2D":
+        pairs.append(([(0,1,2),(0,1,3)],[(0,1,2),(0,2,3)],4,4,"NEWMAN_CODIM2"))
+    if test_codim and dim=="3D":
+        pairs.append(([(0,1,2,3),(0,1,2,4)],[(0,1,2,3),(0,1,3,4)],5,5,"NEWMAN_CODIM3"))
+    if test_functorial and dim=="2D":
+        pairs.append((seed_S2_tetra_boundary()+[(0,1,4)],seed_S2_tetra_boundary(),5,4,"NEWMAN_FUNCT2"))
+    if test_functorial and dim=="3D":
+        pairs.append((seed_S3_4simplex_boundary()+[(0,1,2,5)],seed_S3_4simplex_boundary(),6,5,"NEWMAN_FUNCT3"))
+    if test_oddcycle and dim=="1D":
+        pairs.append((seed_odd_cycle(),seed_odd_cycle(),3,3,"NEWMAN_ODDCYCLE"))
+
+    results,witnesses=[],[]
+    id_counter=0
+    for topA,topB,vA,vB,src in pairs:
+        id_counter+=1
+        facesA=set(f for t in topA for f in faces_of_simplex(t))
+        facesB=set(f for t in topB for f in faces_of_simplex(t))
+        vertsA={v for t in topA for v in t}; vertsB={v for t in topB for v in t}
+        common_vertices=sorted(vertsA&vertsB)
+        iface_map={
+            "face":[f for f in facesA if f in facesB and len(f)==d],
+            "edge":[f for f in facesA if f in facesB and len(f)==2],
+            "vertex":[(v,) for v in common_vertices]
+        }
+        all_tops=list(topA)+list(topB)
+        d_faces=all_d_faces(all_tops,d)
+        D=build_D(all_tops,d_faces)
+        rankD,_=rref_rank_mod2(D); nullity=D.shape[1]-rankD
+
+        for iface_type,cands in iface_map.items():
+            if not cands: continue
+            sample_cands=cands if len(cands)<=5 else random.sample(cands,5)
+            for cand in sample_cands:
+                u=np.zeros(len(all_tops),dtype=np.uint8)
+                for i,t in enumerate(topA):
+                    if set(cand).issubset(set(t)): u[i]=1
+                for j,t in enumerate(topB):
+                    if set(cand).issubset(set(t)): u[len(topA)+j]^=1
+                b=u
+
+                x,rank_solve,in_row_space=solve_mod2(D,b)
+
+                if dim=="3D":
+                    b_all=np.ones(len(all_tops),dtype=np.uint8)
+                    _,_,in_row_space2=solve_mod2(D,b_all)
+                    if not in_row_space2:
+                        in_row_space=False
+
+                result="SUCCESS" if in_row_space else "FAIL"
+                min_support=int(x.sum()) if (x is not None and in_row_space) else ""
+
+                notes=[]
+                if result=="SUCCESS" and (D.size==0 or D.shape[1]==0):
+                    notes.append("SUSPICIOUS: success with empty D")
+
+                witness_json=None
+                if result=="SUCCESS":
+                    phi_cols=[j for j,v in enumerate(x) if v==1]
+                    phi_faces=[d_faces[j] for j in phi_cols]
+                    parity_ok=True
+                    for idx,t in enumerate(all_tops):
+                        cnt=sum(1 for f in phi_faces if set(f).issubset(set(t)))
+                        if (cnt%2)!=int(b[idx]): parity_ok=False; break
+                    if not parity_ok: notes.append("SUSPICIOUS: parity check failed")
+                    witness_json={"topsA":topA,"topsB":topB,"interface_type":iface_type,
+                                  "interface":cand,"phi_faces":phi_faces,"parity_ok":parity_ok,
+                                  "timestamp":datetime.datetime.utcnow().isoformat()+"Z"}
+                    witnesses.append((f"UG-{id_counter}",witness_json))
+
+                row={"ID":f"UG-{id_counter}","source":src,"vA":len(vertsA),"vB":len(vertsB),
+                     "topsA_count":len(topA),"topsB_count":len(topB),
+                     "rows":int(D.shape[0]),"cols":int(D.shape[1]),
+                     "rank":int(rankD),"nullity":int(nullity),
+                     "in_row_space":bool(in_row_space),
+                     "min_support_est":min_support,
+                     "interface_type":iface_type,"interface":str(cand),
+                     "result":result,"notes":" | ".join(notes)}
+                results.append(row)
+
+    success_count=sum(r["result"]=="SUCCESS" for r in results)
+    fail_count=sum(r["result"]=="FAIL" for r in results)
+    meta={"dimension":dim,"vmax":vmax,"mode":mode,"sample_size":int(sample_size),
+          "max_top_cells":int(max_top_cells),"pairs_cap":int(pairs_cap),"seed":int(seed),
+          "admissibility":"Hybrid G0 + Newman","timestamp":datetime.datetime.utcnow().isoformat()+"Z",
+          "row_count":len(results),"success_count":int(success_count),"fail_count":int(fail_count)}
+    sha_payload=json.dumps({"meta":meta,"results":results},sort_keys=True).encode()
+    meta["sha1_hash"]=hashlib.sha1(sha_payload).hexdigest()
+    return results,witnesses,meta
+
+# ---------------- run ----------------
+if run:
+    results,witnesses,meta=run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
+        use_seeds,use_unions,use_towers,use_adversarial,
+        test_core,test_codim,test_functorial,test_oddcycle)
+    st.session_state.results,st.session_state.witnesses,st.session_state.metadata=results,witnesses,meta
+    st.success(f"Done. Rows={len(results)} | SUCCESS={meta['success_count']} | FAIL={meta['fail_count']}")
+
+# ---------------- table & downloads ----------------
+left,right=st.columns([3,2])
+with left:
+    df=pd.DataFrame(st.session_state.results)
+    if not df.empty:
+        preferred=["ID","source","vA","vB","topsA_count","topsB_count",
+                   "rows","cols","rank","nullity","in_row_space","min_support_est",
+                   "interface_type","interface","result","notes"]
+        cols=[c for c in preferred if c in df.columns]+[c for c in df.columns if c not in preferred]
+        df=df[cols]
+    st.dataframe(df,use_container_width=True,height=560)
+
+with right:
+    if st.session_state.results:
+        csv_buf=io.StringIO()
+        pd.DataFrame(st.session_state.results).to_csv(csv_buf,index=False)
+        st.download_button("Download CSV",csv_buf.getvalue(),"phaseU_results.csv",mime="text/csv")
+        zip_buf=io.BytesIO()
+        with zipfile.ZipFile(zip_buf,"w",zipfile.ZIP_DEFLATED) as zf:
+            for wid,wj in st.session_state.witnesses:
+                zf.writestr(f"{wid}_witness.json",json.dumps(wj,indent=2))
+            zf.writestr("run_metadata.json",json.dumps(st.session_state.metadata,indent=2))
+            zf.writestr("results_summary.csv",csv_buf.getvalue())
+        st.download_button("Download Witnesses (ZIP)",zip_buf.getvalue(),
+                           "witnesses_bundle.zip",mime="application/zip")
+    else:
+        st.info("No results yet. Set parameters and press Run.")
