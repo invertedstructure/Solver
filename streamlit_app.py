@@ -25,7 +25,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Newman tests")
-    test_core = st.checkbox("Core normal form (odd simplex)")
+    test_core = st.checkbox("Core normal form (S²/S³)")
     test_codim = st.checkbox("Codim-1 gluing (local star)")
     test_functorial = st.checkbox("Functorial persistence")
     test_oddcycle = st.checkbox("1D odd cycle reduction")
@@ -171,11 +171,11 @@ def run_phaseU(dim,vmax,mode,sample_size,max_top_cells,pairs_cap,seed,
         pairs.append((thin,thin,5,5,"ADV_THIN"))
         pairs.append((dense,dense,4,4,"ADV_DENSE"))
 
-    # Newman injections
-if test_core and dim=="2D":
-    pairs.append((seed_S2_tetra_boundary(), seed_S2_tetra_boundary(), 4, 4, "NEWMAN_CORE2_S2"))
-if test_core and dim=="3D":
-    pairs.append((seed_S3_4simplex_boundary(), seed_S3_4simplex_boundary(), 5, 5, "NEWMAN_CORE3_S3"))
+    # Newman injections (boundaries, not single simplices)
+    if test_core and dim=="2D":
+        pairs.append((seed_S2_tetra_boundary(),seed_S2_tetra_boundary(),4,4,"NEWMAN_CORE2_S2"))
+    if test_core and dim=="3D":
+        pairs.append((seed_S3_4simplex_boundary(),seed_S3_4simplex_boundary(),5,5,"NEWMAN_CORE3_S3"))
     if test_codim and dim=="2D":
         pairs.append(([(0,1,2),(0,1,3)],[(0,1,2),(0,2,3)],4,4,"NEWMAN_CODIM2"))
     if test_codim and dim=="3D":
