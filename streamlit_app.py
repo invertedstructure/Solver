@@ -4,31 +4,41 @@ import pandas as pd
 import itertools, random, json, io, zipfile, hashlib, datetime
 
 # ---------------- UI ----------------
-st.set_page_config(page_title="Phase U — Gluing Sanity", layout="wide")
+st.set_page_config(page_title="Phase U — Gluing Sanity (G0)", layout="wide")
 
 with st.sidebar:
     st.header("Settings")
     dim = st.selectbox("Dimension", ["2D", "3D"], index=1)
     vmax = st.slider("Max vertices (vmax)", 3, 8, 6)
     mode = st.radio("Mode", ["Exhaustive", "Sampled"], index=0)
-    sample_size = st.number_input("Sample size (per (vA,vB) bucket)", 1, 1000, 50)
+    sample_size = st.number_input("Sample size PER (vA,vB) bucket (Sampled)", 1, 500, 50)
     max_top_cells = st.number_input("Max top cells per complex", 1, 6, 3)
     pairs_cap = st.number_input("Pairs cap (global per run)", 10, 100000, 200)
     seed = st.number_input("Random seed", 0, 10**9, 42)
     allow_fusion = st.checkbox("Allow Fusion (A0 off if checked)", value=False)
-    run = st.button("Run")
-    reset = st.button("Reset")
+
+    st.markdown("---")
+    st.subheader("Canonical seeds")
+    use_seeds = st.checkbox("Include protected seeds (persistence checks)", value=True)
+    # (We include S2 in 2D and S3 in 3D; both should FAIL if invariants are sane.)
+
+    st.markdown("---")
+    colb1, colb2 = st.columns(2)
+    with colb1:
+        run = st.button("Run")
+    with colb2:
+        reset = st.button("Reset")
 
 # ---------------- session state ----------------
 if "results" not in st.session_state: st.session_state.results = []
-if "witnesses" not in st.session_state: st.session_state.witnesses = []
+if "witnesses" not in st.session_state: st.session_state.witnesses = []   # list of (ID, witness_json)
 if "metadata"  not in st.session_state: st.session_state.metadata = {}
 
 if reset:
     st.session_state.results = []
     st.session_state.witnesses = []
     st.session_state.metadata = {}
-    st.success("Cleared.")
+    st.success("Cleared state.")
 
 # ---------------- helpers ----------------
 def faces_of_simplex(simplex):
@@ -43,14 +53,15 @@ def all_d_faces(top_simplices, d):
     return sorted(S)
 
 def enumerate_small_complexes(vcount, top_simplex_size, max_top_cells):
+    """All complexes with ≤ max_top_cells top simplices on vcount vertices."""
     verts = list(range(vcount))
     all_possible = list(itertools.combinations(verts, top_simplex_size))
-    # up to max_top_cells top cells
     for r in range(1, min(len(all_possible), max_top_cells)+1):
         for comb in itertools.combinations(all_possible, r):
             yield [tuple(sorted(s)) for s in comb]
 
 def build_D(all_tops, d_faces):
+    """Coboundary matrix over F2: rows = tops, cols = d-faces."""
     D = np.zeros((len(all_tops), len(d_faces)), dtype=np.uint8)
     for i, t in enumerate(all_tops):
         T = set(t)
@@ -59,10 +70,41 @@ def build_D(all_tops, d_faces):
                 D[i, j] = 1
     return D
 
+def rref_rank_mod2(A):
+    """Rank over F2 by in-place row reduction (returns rank, reduced matrix)."""
+    M = (A.copy() % 2).astype(np.uint8)
+    rows, cols = M.shape
+    r = 0
+    for c in range(cols):
+        # find pivot
+        pivot = None
+        for i in range(r, rows):
+            if M[i, c] == 1:
+                pivot = i; break
+        if pivot is None:
+            continue
+        # swap into row r
+        if pivot != r:
+            M[[r, pivot]] = M[[pivot, r]]
+        # eliminate other rows
+        for i in range(rows):
+            if i != r and M[i, c] == 1:
+                M[i, :] ^= M[r, :]
+        r += 1
+        if r == rows: break
+    return r, M
+
 def solve_mod2(A, b):
-    A = A.copy() % 2; b = b.copy() % 2
+    """
+    Solve A x = b over F2. Returns (x, rankA, in_row_space).
+    Produces one solution (not necessarily minimal support) or (None, rankA, False) if inconsistent.
+    """
+    A = (A.copy() % 2).astype(np.uint8)
+    b = (b.copy() % 2).astype(np.uint8)
     rows, cols = A.shape
+    # augmented matrix
     M = np.concatenate([A, b.reshape(-1,1)], axis=1).astype(np.uint8)
+
     r = 0
     piv_cols = []
     for c in range(cols):
@@ -70,38 +112,72 @@ def solve_mod2(A, b):
         for i in range(r, rows):
             if M[i, c] == 1:
                 pivot = i; break
-        if pivot is None: continue
-        M[[r, pivot]] = M[[pivot, r]]
+        if pivot is None:
+            continue
+        if pivot != r:
+            M[[r, pivot]] = M[[pivot, r]]
         piv_cols.append(c)
         for i in range(rows):
             if i != r and M[i, c] == 1:
                 M[i, :] ^= M[r, :]
         r += 1
         if r == rows: break
-    # inconsistent?
+
+    # inconsistency check: 0 ... 0 | 1 row
     for i in range(r, rows):
-        if M[i, -1] == 1: return None
+        if M[i, -1] == 1:
+            return None, r, False
+
+    # build one solution vector: set free vars to 0, read pivots' RHS
     x = np.zeros(cols, dtype=np.uint8)
-    # back-sub not needed for one solution in F2; take pivot rows
     for i, c in enumerate(piv_cols):
         x[c] = M[i, -1]
-    return x % 2
+    return x % 2, r, True
 
-def run_phaseU(dim, vmax, mode, sample_size, max_top_cells, pairs_cap, seed):
+# ---- canonical seeds (protected classes expected to FAIL) ----
+def seed_S2_tetra_boundary():
+    """
+    2D S^2 as boundary of a tetrahedron (4 vertices, 4 triangles).
+    Triangles: (0,1,2), (0,1,3), (0,2,3), (1,2,3)
+    """
+    return [(0,1,2),(0,1,3),(0,2,3),(1,2,3)]
+
+def seed_S3_4simplex_boundary():
+    """
+    3D S^3 as boundary of a 4-simplex on vertices {0,1,2,3,4}:
+    Tetrahedra are all 4-subsets (omit each vertex once).
+    """
+    tets = []
+    V = [0,1,2,3,4]
+    for omit in V:
+        tet = tuple(sorted([v for v in V if v != omit]))
+        tets.append(tet)
+    return tets  # 5 tetrahedra
+
+def add_seed_pairs(dim, pairs_list):
+    """Append seed pairs (A,B,vA,vB,label) to pairs_list."""
+    if dim == "2D":
+        S2 = seed_S2_tetra_boundary()
+        v = len({v for t in S2 for v in t})
+        pairs_list.append((S2, S2, v, v, "SEED_S2"))
+    else:
+        S3 = seed_S3_4simplex_boundary()
+        v = len({v for t in S3 for v in t})
+        pairs_list.append((S3, S3, v, v, "SEED_S3"))
+    return pairs_list
+
+# ---------------- core runner ----------------
+def run_phaseU(dim, vmax, mode, sample_size, max_top_cells, pairs_cap, seed, use_seeds):
     random.seed(seed)
     d = 2 if dim=="2D" else 3
     top_size = d+1
 
-    # build complexes registry keyed by vertex count
+    # registry of complexes per vertex count
     reg = {v: list(enumerate_small_complexes(v, top_size, max_top_cells))
            for v in range(top_size, vmax+1)}
 
     # make (vA,vB) buckets
-    vbuckets = []
-    for vA in reg:
-        for vB in reg:
-            if len(reg[vA]) and len(reg[vB]):
-                vbuckets.append((vA, vB))
+    vbuckets = [(vA, vB) for vA in reg for vB in reg if len(reg[vA]) and len(reg[vB])]
 
     # choose pairs
     pairs = []
@@ -109,26 +185,28 @@ def run_phaseU(dim, vmax, mode, sample_size, max_top_cells, pairs_cap, seed):
         for vA, vB in vbuckets:
             for A in reg[vA]:
                 for B in reg[vB]:
-                    pairs.append((A, B, vA, vB))
+                    pairs.append((A, B, vA, vB, "PROC"))
                     if len(pairs) >= pairs_cap: break
                 if len(pairs) >= pairs_cap: break
             if len(pairs) >= pairs_cap: break
     else:
-        # Sampled: up to sample_size per bucket, but respect pairs_cap
         for vA, vB in vbuckets:
             pool = list(itertools.product(reg[vA], reg[vB]))
             random.shuffle(pool)
             take = min(sample_size, len(pool))
             for A, B in pool[:take]:
-                pairs.append((A, B, vA, vB))
+                pairs.append((A, B, vA, vB, "PROC"))
                 if len(pairs) >= pairs_cap: break
             if len(pairs) >= pairs_cap: break
 
-    results = []
-    witnesses = []
+    # append canonical seed pairs (once)
+    if use_seeds:
+        pairs = add_seed_pairs(dim, pairs)
+
+    results, witnesses = [], []
     id_counter = 0
 
-    for topA, topB, vA, vB in pairs:
+    for topA, topB, vA, vB, src in pairs:
         id_counter += 1
         # discover interfaces (label-based)
         facesA = set(f for t in topA for f in faces_of_simplex(t))
@@ -145,60 +223,73 @@ def run_phaseU(dim, vmax, mode, sample_size, max_top_cells, pairs_cap, seed):
 
         all_tops = list(topA) + list(topB)
         d_faces_global = all_d_faces(all_tops, d)  # G0: global φ allowed
+
+        # Build D once per pair; b is the all-ones vector (u1+u2)
         D = build_D(all_tops, d_faces_global)
         b = np.ones(len(all_tops), dtype=np.uint8)
 
+        # Pre-compute rank/nullity and solvability once (same for any interface under G0)
+        rankD, _ = rref_rank_mod2(D)
+        nullity = D.shape[1] - rankD
+        x, rank_solve, in_row_space = solve_mod2(D, b)
+        min_support_est = int(x.sum()) if x is not None else None
+
+        # For each interface candidate, create a row using the same (D,b) outcome
+        # (We sample up to a few candidates per type to keep the CSV compact.)
         for iface_type, cands in iface_map.items():
-            if not cands:  # still record a 'no interface' scenario?
+            if not cands:
                 continue
-            # take up to 5 candidates per type to keep runs quick
             sample_cands = cands if len(cands) <= 5 else random.sample(cands, 5)
             for cand in sample_cands:
-                sol = solve_mod2(D, b)
-                result = "SUCCESS" if sol is not None else "FAIL"
+                result = "SUCCESS" if in_row_space else "FAIL"
 
-                notes = ""
-                # anomaly G0: (a) not actually shared (shouldn't happen given construction)
+                notes = []
+                # G0 anomaly rules
                 if iface_type == "face" and (cand not in facesA or cand not in facesB):
-                    notes = "SUSPICIOUS: interface not shared"
-                # (b) success but D empty
-                if result=="SUCCESS" and (D.size == 0 or D.shape[1]==0):
-                    notes = "SUSPICIOUS: success with empty D"
-                # (c) face=no though both sides use that face
-                if iface_type=="face" and result=="FAIL" and (cand in facesA and cand in facesB):
-                    notes = "SUSPICIOUS: face=no with common face"
+                    notes.append("SUSPICIOUS: interface not shared")
+                if result == "SUCCESS" and (D.size == 0 or D.shape[1]==0):
+                    notes.append("SUSPICIOUS: success with empty D")
+                if iface_type == "face" and result == "FAIL" and (cand in facesA and cand in facesB):
+                    notes.append("SUSPICIOUS: face=no with common face")
 
                 witness_json = None
-                if result=="SUCCESS":
-                    phi_cols = [j for j, v in enumerate(sol) if v==1]
+                parity_ok = None
+                if result == "SUCCESS":
+                    phi_cols = [j for j, v in enumerate(x) if v == 1]
                     phi_faces = [d_faces_global[j] for j in phi_cols]
-                    # parity check: for each top cell, odd count
+                    # parity check: for each top cell, odd count (δφ(t)=1 matches b=1)
                     parity_ok = True
-                    for i, t in enumerate(all_tops):
+                    for t in all_tops:
                         cnt = sum(1 for f in phi_faces if set(f).issubset(set(t)))
                         if cnt % 2 != 1:
                             parity_ok = False; break
                     if not parity_ok:
-                        notes = (notes+" | " if notes else "") + "SUSPICIOUS: parity check failed"
+                        notes.append("SUSPICIOUS: parity check failed")
                     witness_json = {
                         "topsA": topA, "topsB": topB,
                         "interface_type": iface_type, "interface": cand,
-                        "phi_faces": phi_faces,
-                        "parity_ok": parity_ok,
+                        "phi_faces": phi_faces, "parity_ok": parity_ok,
                         "timestamp": datetime.datetime.utcnow().isoformat()+"Z"
                     }
-                    witnesses.append(("UG-%d" % id_counter, witness_json))
+                    witnesses.append((f"UG-{id_counter}", witness_json))
 
                 row = {
                     "ID": f"UG-{id_counter}",
+                    "source": src,
                     "vA": len(vertsA),
                     "vB": len(vertsB),
                     "topsA_count": len(topA),
                     "topsB_count": len(topB),
+                    "rows": int(D.shape[0]),
+                    "cols": int(D.shape[1]),
+                    "rank": int(rankD),
+                    "nullity": int(nullity),
+                    "in_row_space": bool(in_row_space),
+                    "min_support_est": min_support_est if min_support_est is not None else "",
                     "interface_type": iface_type,
                     "interface": str(cand),
                     "result": result,
-                    "notes": notes
+                    "notes": " | ".join(notes)
                 }
                 results.append(row)
 
@@ -218,11 +309,12 @@ def run_phaseU(dim, vmax, mode, sample_size, max_top_cells, pairs_cap, seed):
     }
     sha_payload = json.dumps({"meta": meta, "results": results}, sort_keys=True).encode()
     meta["sha1_hash"] = hashlib.sha1(sha_payload).hexdigest()
+
     return results, witnesses, meta
 
 # ---------------- run ----------------
 if run:
-    results, witnesses, meta = run_phaseU(dim, vmax, mode, sample_size, max_top_cells, pairs_cap, seed)
+    results, witnesses, meta = run_phaseU(dim, vmax, mode, sample_size, max_top_cells, pairs_cap, seed, use_seeds)
     st.session_state.results = results
     st.session_state.witnesses = witnesses
     st.session_state.metadata = meta
@@ -233,7 +325,14 @@ left, right = st.columns([3,2])
 
 with left:
     df = pd.DataFrame(st.session_state.results)
-    st.dataframe(df, use_container_width=True, height=500)
+    if not df.empty:
+        # Column order for readability
+        preferred = ["ID","source","vA","vB","topsA_count","topsB_count",
+                     "rows","cols","rank","nullity","in_row_space","min_support_est",
+                     "interface_type","interface","result","notes"]
+        cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+        df = df[cols]
+    st.dataframe(df, use_container_width=True, height=560)
 
 with right:
     if st.session_state.results:
